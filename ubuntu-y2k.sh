@@ -742,7 +742,7 @@ apply_settings() {
 
   # ── Wallpaper ──
   step "Downloading and applying wallpaper"
-  WALLPAPER_URL="https://images-assets.nasa.gov/image/art002e009287/art002e009287~large.jpg?w=1920&h=1280&fit=clip&crop=faces%2Cfocalpoint"
+  WALLPAPER_URL="https://www.nasa.gov/wp-content/uploads/2026/04/art002e009288orig.jpg"
   WALLPAPER_PATH="$HOME/Pictures/nasa-wallpaper.jpg"
   mkdir -p "$HOME/Pictures"
   if curl -fsSL "$WALLPAPER_URL" -o "$WALLPAPER_PATH"; then
