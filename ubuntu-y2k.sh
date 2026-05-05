@@ -242,6 +242,7 @@ install_apt_packages() {
   try "${APT_INSTALL[@]}" steam-installer
 
   step "GNOME apps"
+  # Note: Ptyxis is the default terminal on Ubuntu 26.04 — no need to install gnome-terminal.
   try "${APT_INSTALL[@]}" \
     gnome-tweaks baobab nautilus deja-dup gnome-boxes gnome-calculator \
     gnome-calendar gnome-snapshot gnome-characters gnome-connections \
@@ -652,10 +653,10 @@ apply_settings() {
   try gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false
 
   # ── Dock favorites (Chrome, Files, Text Editor, Terminal, Calculator) ──
-  # Note: Ubuntu 26.04 keeps gnome-terminal as default (Ptyxis is Fedora's default).
+  # Note: Ubuntu 26.04 ships Ptyxis as the default terminal (same as Fedora 41+).
   step "Setting dock shortcuts"
   try gsettings set org.gnome.shell favorite-apps \
-    "['google-chrome.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.TextEditor.desktop', 'org.gnome.Terminal.desktop', 'org.gnome.Calculator.desktop']"
+    "['google-chrome.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.TextEditor.desktop', 'org.gnome.Ptyxis.desktop', 'org.gnome.Calculator.desktop']"
 
   # ── Default browser: Google Chrome ──
   step "Setting Google Chrome as default web browser"
