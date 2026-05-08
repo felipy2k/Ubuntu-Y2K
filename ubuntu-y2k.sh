@@ -330,6 +330,7 @@ install_flatpaks() {
     org.localsend.localsend_app             # LocalSend (LAN file sharing)
     io.gitlab.adhami3310.Converter          # Switcheroo (image format converter)
     io.podman_desktop.PodmanDesktop         # Podman Desktop (container management)
+    io.github.input_leap.InputLeap          # InputLeap (share mouse/keyboard across computers)
     # NOTE: Resources (net.nokyan.Resources) is NOT installed via Flatpak —
     # Ubuntu 26.04 ships Resources natively as the default system monitor.
 
@@ -495,6 +496,7 @@ install_gnome_extensions() {
     gsconnect@andyholmes.github.io            # GSConnect (KDE Connect for GNOME)
     tilingshell@ferrarodomenico.com           # Tiling Shell
     Vitals@CoreCoding.com                     # Vitals (CPU/RAM/temp/network monitor in panel)
+    AlphabeticalAppGrid@stuarthayhurst        # Alphabetical App Grid
   )
 
   if command -v gext &>/dev/null; then
