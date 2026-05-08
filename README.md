@@ -10,13 +10,13 @@ Automates repositories, codecs, packages, Flatpaks, GNOME extensions, default ap
 - Ubuntu **26.04 LTS** (fresh install recommended)
 - A user account with `sudo` access
 - Internet connection
-- `git` installed — if not: `sudo apt install git -y`
 
 ---
 
 ## 🚀 Usage
 
 ```bash
+sudo apt install git -y
 git clone https://github.com/felipy2k/Ubuntu-Y2K.git
 cd Ubuntu-Y2K
 bash ubuntu-y2k.sh
