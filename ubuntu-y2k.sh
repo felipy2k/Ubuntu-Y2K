@@ -36,6 +36,56 @@ try() {
   return 0
 }
 
+# Purge packages, silently skipping those not installed.
+# apt-get purge aborts the whole transaction on a single missing package, so
+# we filter the list to only what's actually installed first.
+# Supports glob patterns (e.g. 'libreoffice*', 'transmission-*').
+purge_if_installed() {
+  local pkgs
+  # dpkg-query expands globs and filters to actually-installed packages.
+  pkgs=$(dpkg-query -W -f='${Package}\n' "$@" 2>/dev/null || true)
+  if [[ -n "$pkgs" ]]; then
+    # shellcheck disable=SC2086  # we want word-splitting here
+    try sudo apt-get purge -y $pkgs
+  fi
+}
+
+# Wait for any background apt/dpkg/snapd process to release the lock.
+# snapd on Ubuntu 26.04 runs automatic snap refreshes that hold dpkg's lock,
+# causing 'apt-get' to fail with "Could not get lock /var/lib/dpkg/lock-frontend".
+wait_for_apt() {
+  local lock_files=(
+    /var/lib/dpkg/lock-frontend
+    /var/lib/dpkg/lock
+    /var/lib/apt/lists/lock
+    /var/cache/apt/archives/lock
+  )
+  local waited=0
+  while true; do
+    local locked=false
+    for f in "${lock_files[@]}"; do
+      if sudo fuser "$f" &>/dev/null 2>&1; then
+        locked=true
+        break
+      fi
+    done
+    $locked || break
+    if [[ $waited -eq 0 ]]; then
+      step "Waiting for apt/dpkg lock to be released (snapd may be refreshing)..."
+    fi
+    sleep 2
+    (( waited += 2 ))
+    if [[ $waited -ge 120 ]]; then
+      warning "apt lock held for over 2 minutes — forcing release and continuing."
+      sudo killall apt apt-get dpkg 2>/dev/null || true
+      sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+                 /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+      sudo dpkg --configure -a 2>/dev/null || true
+      break
+    fi
+  done
+}
+
 if [[ "$EUID" -eq 0 ]]; then
   fail "Do not run as root. Run as a regular user."
   exit 1
@@ -55,8 +105,10 @@ fi
 # Non-interactive frontend so apt doesn't prompt during the run
 export DEBIAN_FRONTEND=noninteractive
 
-# Apt flags reused everywhere — quiet but informative, no recommends to keep things lean
-APT_INSTALL=(sudo apt-get install -y --no-install-recommends)
+# Apt flags reused everywhere — quiet but informative, no recommends to keep things lean.
+# --allow-downgrades is required to swap the Firefox snap shim (whose '1:' epoch
+# makes its version appear higher) for the real .deb from the Mozilla Team PPA.
+APT_INSTALL=(sudo apt-get install -y --no-install-recommends --allow-downgrades)
 
 show_menu() {
   clear
@@ -86,6 +138,7 @@ show_menu() {
 # ─────────────────────────────────────────────
 add_repos() {
   info "[REPOS] Adding repositories"
+  wait_for_apt
 
   step "Ensuring keyrings directory exists"
   try sudo install -d -m 0755 /etc/apt/keyrings
@@ -131,7 +184,7 @@ add_repos() {
   #     a higher version string than the PPA, blocking the swap without 1001)
   #   - It also prevents unattended-upgrades from quietly switching back to
   #     the snap on future updates.
-  if ! grep -rq '^deb .*mozillateam' /etc/apt/sources.list.d/ 2>/dev/null; then
+  if ! grep -rq 'mozillateam' /etc/apt/sources.list.d/ 2>/dev/null; then
     try sudo add-apt-repository -y ppa:mozillateam/ppa
   fi
   sudo tee /etc/apt/preferences.d/mozilla-firefox > /dev/null <<'EOF'
@@ -148,9 +201,12 @@ EOF
 # ─────────────────────────────────────────────
 update_system() {
   info "[SYSTEM] Updating system"
+  wait_for_apt
   try sudo apt-get update
-  try sudo apt-get upgrade -y
-  try sudo apt-get full-upgrade -y
+  # --allow-downgrades is needed because the Mozilla PPA's Firefox replaces the
+  # snap shim (which carries a '1:' epoch and therefore looks "newer" to apt).
+  try sudo apt-get upgrade -y --allow-downgrades
+  try sudo apt-get full-upgrade -y --allow-downgrades
 }
 
 # ─────────────────────────────────────────────
@@ -211,7 +267,7 @@ install_apt_packages() {
   step "Base tools"
   try "${APT_INSTALL[@]}" \
     git wget curl fastfetch pipx papirus-icon-theme \
-    build-essential dkms
+    build-essential dkms pciutils
 
   step "Flatpak runtime + GNOME Software integration plugin"
   # flatpak provides the runtime; gnome-software-plugin-flatpak is what makes
@@ -220,11 +276,18 @@ install_apt_packages() {
   # later), but we install gnome-software in [GNOME apps] below, which does.
   try "${APT_INSTALL[@]}" flatpak gnome-software-plugin-flatpak
 
-  step "Browsers"
-  # Firefox here pulls the native .deb from the Mozilla Team PPA (added in
-  # add_repos with priority 1001), NOT the snap shim from main.
+  step "Browsers (Chrome, Brave, Tor)"
+  # Firefox is split into its own step below — installing it via apt requires
+  # --allow-downgrades to swap the snap shim, and a single failure here would
+  # otherwise abort the whole transaction and take Chrome/Brave down with it.
   try "${APT_INSTALL[@]}" \
-    google-chrome-stable brave-browser firefox torbrowser-launcher
+    google-chrome-stable brave-browser torbrowser-launcher
+
+  step "Firefox (.deb from Mozilla Team PPA)"
+  # The PPA pin (priority 1001, set in add_repos) selects this version.
+  # The snap shim's '1:' epoch makes apt see this as a downgrade — that's
+  # what --allow-downgrades in APT_INSTALL handles.
+  try "${APT_INSTALL[@]}" firefox
 
   step "Multimedia apps"
   try "${APT_INSTALL[@]}" \
@@ -248,7 +311,23 @@ install_apt_packages() {
 
   step "Utilities"
   try "${APT_INSTALL[@]}" \
-    timeshift solaar dreamchess lm-sensors input-leap
+    timeshift solaar dreamchess lm-sensors
+
+  step "InputLeap (share mouse/keyboard across computers)"
+  # input-leap isn't in Ubuntu 26.04's archives yet — try apt first, fall back
+  # to Flatpak so the app is at least available (with sandbox limitations on
+  # input device access). Re-run option [4] later when the .deb lands.
+  if apt-cache show input-leap &>/dev/null; then
+    try "${APT_INSTALL[@]}" input-leap
+  else
+    warning "input-leap not in apt archives — installing via Flatpak as fallback."
+    if ! command -v flatpak &>/dev/null; then
+      try "${APT_INSTALL[@]}" flatpak gnome-software-plugin-flatpak
+    fi
+    try flatpak remote-add --if-not-exists flathub \
+      https://flathub.org/repo/flathub.flatpakrepo
+    try flatpak install -y flathub io.github.input_leap.InputLeap
+  fi
 
   # ── NordVPN — official installer (handles repo + GPG + install) ──
   step "NordVPN"
@@ -530,12 +609,14 @@ remove_bloat() {
   fi
 
   step "Removing LibreOffice (replaced by FreeOffice)"
-  try sudo apt-get purge -y 'libreoffice*'
+  purge_if_installed 'libreoffice*'
 
   step "Removing default GNOME media players (replaced by VLC)"
   # Ubuntu 26.04 ships Showtime + Decibels as new defaults. Keep cleanup compatible
   # with upgrades from 24.04/25.10 by also removing legacy Totem/Rhythmbox.
-  try sudo apt-get purge -y \
+  # purge_if_installed silently skips packages that aren't there (e.g. Decibels
+  # may not be in the archives yet, Cheese was removed from default installs).
+  purge_if_installed \
     showtime \
     decibels \
     totem \
@@ -545,16 +626,16 @@ remove_bloat() {
     gnome-music
 
   step "Removing default photo/scanner apps replaced by Loupe / Simple Scan"
-  try sudo apt-get purge -y shotwell
+  purge_if_installed shotwell
 
   step "Removing default mail client (using Chrome/web mail)"
-  try sudo apt-get purge -y 'thunderbird*'
+  purge_if_installed 'thunderbird*'
 
   step "Removing default torrent client (replaced by Motrix Flatpak)"
-  try sudo apt-get purge -y 'transmission-*'
+  purge_if_installed 'transmission-*'
 
   step "Removing GNOME Extensions Manager apt app (replaced by Extension Manager Flatpak)"
-  try sudo apt-get purge -y gnome-shell-extension-prefs
+  purge_if_installed gnome-shell-extension-prefs
 
   step "Removing Snap Store / App Center (keeping GNOME Software as default store)"
   # On Ubuntu 26.04 the App Center is delivered as a snap named 'snap-store'.
@@ -571,18 +652,19 @@ remove_bloat() {
     try sudo snap remove --purge snap-store
   fi
   # Defensive: remove any apt-side shim if it exists under either name.
-  try sudo apt-get purge -y ubuntu-software 2>/dev/null
+  purge_if_installed ubuntu-software
 
   step "Removing Firefox snap (replaced by the native .deb from Mozilla PPA)"
-  # The Mozilla Team PPA's .deb is now installed. The original snap left over
-  # from the Ubuntu default install would shadow it in the launcher and waste
-  # disk. NOTE: snap profile data lives in ~/snap/firefox/ — if you had
-  # bookmarks/passwords there, copy them to ~/.mozilla/firefox/ before purging.
-  # SAFETY: only remove the snap if the .deb Firefox is actually installed —
-  # otherwise we'd leave the user with no Firefox at all.
-  if ! dpkg -s firefox &>/dev/null; then
-    warning "Firefox .deb not installed — skipping snap removal so you don't lose"
-    warning "the browser. Run option [4] first to install the .deb from Mozilla PPA."
+  # SAFETY: only remove the snap if the REAL .deb is installed — not just the
+  # snap shim. The shim (package: firefox, version: 1:1snap1-*) is also an apt
+  # package, so dpkg -s firefox returns 0 for both. We check the version string:
+  # the shim always contains 'snap', the real .deb never does.
+  # Without this check, a failed .deb install would cause us to remove the snap
+  # and leave the user with no browser at all.
+  FIREFOX_VER=$(dpkg-query -W -f='${Version}' firefox 2>/dev/null || true)
+  if [[ -z "$FIREFOX_VER" ]] || [[ "$FIREFOX_VER" == *snap* ]]; then
+    warning "Firefox .deb not installed (snap shim still active) — skipping snap"
+    warning "removal to avoid losing the browser. Run option [4] first."
   elif command -v snap &>/dev/null && snap list firefox &>/dev/null 2>&1; then
     try sudo snap remove --purge firefox
   fi
@@ -591,7 +673,7 @@ remove_bloat() {
   # (replaced upstream by Resources, which is now the apt default). Nothing to remove.
 
   step "Removing GNOME games"
-  try sudo apt-get purge -y \
+  purge_if_installed \
     aisleriot \
     gnome-mahjongg \
     gnome-mines \
@@ -599,7 +681,7 @@ remove_bloat() {
     gnome-2048
 
   step "Removing unnecessary apps"
-  try sudo apt-get purge -y \
+  purge_if_installed \
     cheese \
     gnome-tour \
     gnome-weather \
