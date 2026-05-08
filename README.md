@@ -67,9 +67,9 @@ bash ubuntu-y2k.sh
 ---
 
 ### 🎵 Multimedia Codecs
-- `ubuntu-restricted-extras` — libavcodec-extra, lame, MS Core Fonts, unrar
-- Full GStreamer plugin stack (base, good, bad, ugly, libav, vaapi)
-- `ffmpeg`
+- `ubuntu-restricted-extras` — pulls in libavcodec-extra, lame, MS Core Fonts, unrar, GStreamer plugins (ugly, libav) automatically
+- `gstreamer1.0-vaapi` — VA-API bridge for hardware decode/encode (not included in restricted-extras)
+- `ffmpeg` — full CLI binary (restricted-extras only pulls the libs)
 - Hardware VA-API / VDPAU drivers — auto-detected per GPU (AMD / Intel)
 
 ---
