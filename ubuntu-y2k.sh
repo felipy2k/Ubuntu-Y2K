@@ -419,7 +419,7 @@ install_flatpaks() {
     org.upscayl.Upscayl                     # AI image upscaler
     io.github.nokse22.Exhibit               # 3D model viewer
     com.github.phase1geo.Minder             # Mind mapping
-    com.motrix.Motrix                       # Download manager
+    net.agalwood.Motrix                     # Download manager
 
     # Entertainment / Sound / Other
     com.rafaelmardojai.Blanket              # Ambient sounds
