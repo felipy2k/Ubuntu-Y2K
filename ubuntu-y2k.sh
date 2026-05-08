@@ -20,11 +20,9 @@ warning() { echo -e "  ${YELLOW}⚠ $*${NC}"; ((WARN_COUNT++)) || true; }
 fail()    { echo -e "${RED}✗ $*${NC}"; }
 ok()      { echo -e "  ${GREEN}✓ $*${NC}"; }
 
-# Counter to summarize warnings at the end
 WARN_COUNT=0
 
-# Robust try() — works correctly with set -e/pipefail by toggling it locally.
-# Returns 0 always, so a failure inside try() never aborts the script.
+# Robust try() — returns 0 always so failures never abort the script
 try() {
   set +e
   "$@"
@@ -36,23 +34,20 @@ try() {
   return 0
 }
 
-# Purge packages, silently skipping those not installed.
-# apt-get purge aborts the whole transaction on a single missing package, so
-# we filter the list to only what's actually installed first.
-# Supports glob patterns (e.g. 'libreoffice*', 'transmission-*').
+# Purge only packages that are actually installed.
+# apt-get purge aborts the whole transaction on a single missing package,
+# so we filter first. Supports globs (e.g. 'libreoffice*').
 purge_if_installed() {
   local pkgs
-  # dpkg-query expands globs and filters to actually-installed packages.
   pkgs=$(dpkg-query -W -f='${Package}\n' "$@" 2>/dev/null || true)
   if [[ -n "$pkgs" ]]; then
-    # shellcheck disable=SC2086  # we want word-splitting here
+    # shellcheck disable=SC2086
     try sudo apt-get purge -y $pkgs
   fi
 }
 
-# Wait for any background apt/dpkg/snapd process to release the lock.
-# snapd on Ubuntu 26.04 runs automatic snap refreshes that hold dpkg's lock,
-# causing 'apt-get' to fail with "Could not get lock /var/lib/dpkg/lock-frontend".
+# Wait for snapd / unattended-upgrades to release the apt lock before proceeding.
+# Without this, apt-get fails with "Could not get lock /var/lib/dpkg/lock-frontend".
 wait_for_apt() {
   local lock_files=(
     /var/lib/dpkg/lock-frontend
@@ -71,12 +66,12 @@ wait_for_apt() {
     done
     $locked || break
     if [[ $waited -eq 0 ]]; then
-      step "Waiting for apt/dpkg lock to be released (snapd may be refreshing)..."
+      step "Waiting for apt/dpkg lock (snapd may be refreshing)..."
     fi
     sleep 2
     (( waited += 2 ))
     if [[ $waited -ge 120 ]]; then
-      warning "apt lock held for over 2 minutes — forcing release and continuing."
+      warning "apt lock held for over 2 minutes — forcing release."
       sudo killall apt apt-get dpkg 2>/dev/null || true
       sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
                  /var/lib/apt/lists/lock /var/cache/apt/archives/lock
@@ -91,23 +86,19 @@ if [[ "$EUID" -eq 0 ]]; then
   exit 1
 fi
 
-# Detect Ubuntu version from /etc/os-release (e.g. "26.04")
+# Detect Ubuntu version from /etc/os-release
 if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
   . /etc/os-release
   UBUNTU_VER="${VERSION_ID:-unknown}"
-  UBUNTU_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-unknown}}"
 else
   UBUNTU_VER="unknown"
-  UBUNTU_CODENAME="unknown"
 fi
 
-# Non-interactive frontend so apt doesn't prompt during the run
 export DEBIAN_FRONTEND=noninteractive
 
-# Apt flags reused everywhere — quiet but informative, no recommends to keep things lean.
-# --allow-downgrades is required to swap the Firefox snap shim (whose '1:' epoch
-# makes its version appear higher) for the real .deb from the Mozilla Team PPA.
+# --allow-downgrades is required to replace the Firefox snap shim
+# (version 1:1snap1-* whose epoch makes it appear "newer" than the Mozilla PPA .deb)
 APT_INSTALL=(sudo apt-get install -y --no-install-recommends --allow-downgrades)
 
 show_menu() {
@@ -143,17 +134,13 @@ add_repos() {
   step "Ensuring keyrings directory exists"
   try sudo install -d -m 0755 /etc/apt/keyrings
 
-  # IMPORTANT: software-properties-common provides 'add-apt-repository' itself —
-  # it MUST be installed before any add-apt-repository call. On Desktop installs
-  # it's preinstalled, but Server/minimal/container installs need this first.
-  step "Installing prerequisites for adding third-party repos"
+  # software-properties-common provides add-apt-repository — must be installed first
+  step "Installing prerequisites"
   try sudo apt-get update
   try "${APT_INSTALL[@]}" curl wget gnupg ca-certificates apt-transport-https \
     software-properties-common
 
-  step "Enabling universe and multiverse components"
-  # 'universe' provides VLC, OBS, Steam metapackage; 'multiverse' provides
-  # ubuntu-restricted-extras (MS Core fonts, libavcodec-extra, lame).
+  step "Enabling universe and multiverse"
   try sudo add-apt-repository -y universe
   try sudo add-apt-repository -y multiverse
 
@@ -177,16 +164,12 @@ add_repos() {
       | sudo tee /etc/apt/sources.list.d/brave-browser-release.list > /dev/null
   fi
 
-  step "Mozilla Team PPA (native Firefox .deb instead of snap shim)"
-  # The 'firefox' package in main is a transitional shim that pulls the snap.
-  # The Mozilla Team PPA ships the real .deb. Priority 1001 is mandatory:
-  #   - 1001 lets apt downgrade across origins (the snap shim sometimes carries
-  #     a higher version string than the PPA, blocking the swap without 1001)
-  #   - It also prevents unattended-upgrades from quietly switching back to
-  #     the snap on future updates.
+  step "Mozilla Team PPA (native Firefox .deb)"
+  # grep handles both legacy 'deb ...' and DEB822 '.sources' formats
   if ! grep -rq 'mozillateam' /etc/apt/sources.list.d/ 2>/dev/null; then
     try sudo add-apt-repository -y ppa:mozillateam/ppa
   fi
+  # Priority 1001 forces the .deb to win over the snap shim's '1:' epoch
   sudo tee /etc/apt/preferences.d/mozilla-firefox > /dev/null <<'EOF'
 Package: firefox*
 Pin: release o=LP-PPA-mozillateam
@@ -203,105 +186,75 @@ update_system() {
   info "[SYSTEM] Updating system"
   wait_for_apt
   try sudo apt-get update
-  # --allow-downgrades is needed because the Mozilla PPA's Firefox replaces the
-  # snap shim (which carries a '1:' epoch and therefore looks "newer" to apt).
   try sudo apt-get upgrade -y --allow-downgrades
   try sudo apt-get full-upgrade -y --allow-downgrades
 }
 
 # ─────────────────────────────────────────────
-# CODECS — ubuntu-restricted-extras + libavcodec-extra + GPU VAAPI
-# Equivalent to RPM Fusion's "Multimedia" group on Fedora.
+# CODECS
 # ─────────────────────────────────────────────
 install_codecs() {
   info "[CODECS] Installing multimedia codecs"
 
-  step "Pre-accepting Microsoft EULAs (so the install runs unattended)"
+  step "Pre-accepting Microsoft EULAs"
   echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" \
     | sudo debconf-set-selections
   echo "ttf-mscorefonts-installer msttcorefonts/present-mscorefonts-eula note" \
     | sudo debconf-set-selections
 
-  step "Installing ubuntu-restricted-extras (codecs, MS fonts, lame, libavcodec-extra)"
-  # ubuntu-restricted-extras is the canonical entry point: pulls in libavcodec-extra,
-  # gstreamer1.0-libav, gstreamer1.0-plugins-ugly, ttf-mscorefonts-installer,
-  # unrar, and the right GStreamer plugin set for the desktop.
+  step "ubuntu-restricted-extras (codecs, MS fonts, lame, libavcodec-extra)"
   try "${APT_INSTALL[@]}" ubuntu-restricted-extras
 
-  step "Installing only what ubuntu-restricted-extras does NOT already include"
-  # gstreamer1.0-vaapi — VA-API bridge for GStreamer (hardware decode/encode)
-  # ffmpeg             — full CLI binary (restricted-extras only pulls the libs)
-  try "${APT_INSTALL[@]}" \
-    gstreamer1.0-vaapi \
-    ffmpeg
+  step "gstreamer1.0-vaapi + ffmpeg (not included in restricted-extras)"
+  try "${APT_INSTALL[@]}" gstreamer1.0-vaapi ffmpeg
 
-  step "Hardware video acceleration (VA-API/VDPAU)"
-  # Auto-detects GPU to apply the correct drivers
+  step "Hardware VA-API/VDPAU (auto-detected)"
   if lspci -d ::0300 -d ::0302 -d ::0380 2>/dev/null | grep -qi 'amd\|radeon\|ati'; then
-    step "AMD GPU detected — installing mesa VA-API/VDPAU drivers"
-    # On Ubuntu the mesa-va-drivers / mesa-vdpau-drivers packages from main already
-    # include H.264/H.265 support (no 'freeworld' split like on Fedora/RPM Fusion).
+    step "AMD GPU — mesa VA-API/VDPAU drivers"
     try "${APT_INSTALL[@]}" mesa-va-drivers mesa-vdpau-drivers vainfo vdpauinfo
   fi
-
   if lspci -d ::0300 -d ::0302 -d ::0380 2>/dev/null | grep -qi 'intel'; then
-    step "Intel GPU detected — installing intel-media-va-driver-non-free"
-    # The 'non-free' variant (from multiverse) enables HEVC/VP9 decode on Gen9+ iGPUs.
+    step "Intel GPU — intel-media-va-driver-non-free"
     try "${APT_INSTALL[@]}" intel-media-va-driver-non-free i965-va-driver-shaders vainfo
   fi
 }
 
 # ─────────────────────────────────────────────
 # APT PACKAGES
-# Install EVERYTHING before removing anything
-# to avoid breaking dependencies
+# Install everything BEFORE removing anything
 # ─────────────────────────────────────────────
 install_apt_packages() {
   info "[APT] Installing APT packages"
 
   install_codecs
 
-  # Install in logical groups so a failure in one group doesn't silently
-  # cascade and skip everything else. Each group has its own try().
-
   step "Base tools"
   try "${APT_INSTALL[@]}" \
     git wget curl fastfetch pipx papirus-icon-theme \
     build-essential dkms pciutils
 
-  step "Flatpak runtime + GNOME Software integration plugin"
-  # flatpak provides the runtime; gnome-software-plugin-flatpak is what makes
-  # Flatpak apps show up and update inside GNOME Software's UI.
-  # Note: Ubuntu 26.04's App Center does not yet integrate Flatpak (planned for
-  # later), but we install gnome-software in [GNOME apps] below, which does.
+  step "Flatpak + GNOME Software plugin"
   try "${APT_INSTALL[@]}" flatpak gnome-software-plugin-flatpak
 
   step "Browsers (Chrome, Brave, Tor)"
-  # Firefox is split into its own step below — installing it via apt requires
-  # --allow-downgrades to swap the snap shim, and a single failure here would
-  # otherwise abort the whole transaction and take Chrome/Brave down with it.
-  try "${APT_INSTALL[@]}" \
-    google-chrome-stable brave-browser torbrowser-launcher
+  # Firefox is intentionally separate — a failure here must not abort Chrome/Brave
+  try "${APT_INSTALL[@]}" google-chrome-stable brave-browser torbrowser-launcher
 
   step "Firefox (.deb from Mozilla Team PPA)"
-  # The PPA pin (priority 1001, set in add_repos) selects this version.
-  # The snap shim's '1:' epoch makes apt see this as a downgrade — that's
-  # what --allow-downgrades in APT_INSTALL handles.
+  # --allow-downgrades in APT_INSTALL handles the '1:' epoch of the snap shim
   try "${APT_INSTALL[@]}" firefox
 
-  step "Multimedia apps"
-  try "${APT_INSTALL[@]}" \
-    vlc audacity darktable handbrake easyeffects obs-studio
+  step "Multimedia"
+  try "${APT_INSTALL[@]}" vlc audacity darktable handbrake easyeffects obs-studio
 
   step "Graphics / 3D"
-  try "${APT_INSTALL[@]}" \
-    gimp inkscape blender
+  try "${APT_INSTALL[@]}" gimp inkscape blender
 
   step "Gaming"
   try "${APT_INSTALL[@]}" steam-installer
 
   step "GNOME apps"
-  # Note: Ptyxis is the default terminal on Ubuntu 26.04 — no need to install gnome-terminal.
+  # Ptyxis is the default terminal on Ubuntu 26.04 — gnome-terminal not needed
   try "${APT_INSTALL[@]}" \
     gnome-tweaks baobab nautilus deja-dup gnome-boxes gnome-calculator \
     gnome-calendar gnome-snapshot gnome-characters gnome-connections \
@@ -310,17 +263,14 @@ install_apt_packages() {
     gnome-logs evince loupe
 
   step "Utilities"
-  try "${APT_INSTALL[@]}" \
-    timeshift solaar dreamchess lm-sensors
+  try "${APT_INSTALL[@]}" timeshift solaar dreamchess lm-sensors
 
   step "InputLeap (share mouse/keyboard across computers)"
-  # input-leap isn't in Ubuntu 26.04's archives yet — try apt first, fall back
-  # to Flatpak so the app is at least available (with sandbox limitations on
-  # input device access). Re-run option [4] later when the .deb lands.
+  # input-leap may not be in 26.04 archives yet — fall back to Flatpak if absent
   if apt-cache show input-leap &>/dev/null; then
     try "${APT_INSTALL[@]}" input-leap
   else
-    warning "input-leap not in apt archives — installing via Flatpak as fallback."
+    warning "input-leap not in apt — installing via Flatpak as fallback."
     if ! command -v flatpak &>/dev/null; then
       try "${APT_INSTALL[@]}" flatpak gnome-software-plugin-flatpak
     fi
@@ -329,20 +279,16 @@ install_apt_packages() {
     try flatpak install -y flathub io.github.input_leap.InputLeap
   fi
 
-  # ── NordVPN — official installer (handles repo + GPG + install) ──
   step "NordVPN"
   if ! command -v nordvpn &>/dev/null; then
     if curl -sSf --max-time 10 -o /dev/null https://downloads.nordcdn.com/apps/linux/install.sh 2>/dev/null; then
-      step "Running official NordVPN installer (CLI + GUI)"
       if sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh) -p nordvpn-gui; then
         ok "NordVPN installed."
         try sudo systemctl enable --now nordvpnd
         try sudo usermod -aG nordvpn "$USER"
-        ok "Log in with: nordvpn login"
         warning "Group membership requires logout/reboot. For immediate use: newgrp nordvpn"
       else
-        warning "NordVPN installer failed. Try manually after reboot:"
-        echo "  sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh)"
+        warning "NordVPN installer failed. Try manually: sh <(curl -sSf https://downloads.nordcdn.com/apps/linux/install.sh)"
       fi
     else
       warning "Cannot reach nordcdn.com — skipping NordVPN."
@@ -354,27 +300,18 @@ install_apt_packages() {
 
 # ─────────────────────────────────────────────
 # FREEOFFICE
-# Replaces LibreOffice (removed afterwards)
 # ─────────────────────────────────────────────
 install_freeoffice() {
   info "[FREEOFFICE] Installing FreeOffice 2024"
-
-  # Check connectivity before attempting curl | bash
   if ! curl -fsSL --max-time 5 -o /dev/null https://softmaker.net/down/install-softmaker-freeoffice-2024.sh 2>/dev/null; then
-    warning "Cannot reach softmaker.net — skipping FreeOffice installation."
-    warning "Run option [4] later when connected, or install manually:"
+    warning "Cannot reach softmaker.net — skipping. Run option [4] later or install manually:"
     echo "  curl -fsSL https://softmaker.net/down/install-softmaker-freeoffice-2024.sh | sudo bash"
     return
   fi
-
-  step "Downloading and running official installer"
-  # The same SoftMaker installer auto-detects DEB vs RPM — works on Ubuntu unchanged.
-  # Also configures the apt repo so future updates flow through 'apt upgrade'.
   if curl -fsSL https://softmaker.net/down/install-softmaker-freeoffice-2024.sh | sudo bash; then
-    ok "FreeOffice installed successfully."
+    ok "FreeOffice installed."
   else
-    warning "Failed to install FreeOffice. Try manually:"
-    echo "  curl -fsSL https://softmaker.net/down/install-softmaker-freeoffice-2024.sh | sudo bash"
+    warning "FreeOffice failed. Try: curl -fsSL https://softmaker.net/down/install-softmaker-freeoffice-2024.sh | sudo bash"
   fi
 }
 
@@ -384,11 +321,8 @@ install_freeoffice() {
 install_flatpaks() {
   info "[FLATPAK] Installing apps from Flathub"
 
-  # Defensive: install_apt_packages already installs flatpak +
-  # gnome-software-plugin-flatpak; this check only fires when the user runs
-  # option [5] standalone without having run [1] or [4] first.
   if ! command -v flatpak &>/dev/null; then
-    step "flatpak not found — installing it now"
+    step "flatpak not found — installing now"
     try "${APT_INSTALL[@]}" flatpak gnome-software-plugin-flatpak
   fi
 
@@ -401,12 +335,10 @@ install_flatpaks() {
     com.github.tchx84.Flatseal              # Flatpak permissions manager
     io.github.peazip.PeaZip                 # Archive manager
     com.system76.Popsicle                   # USB image flasher
-    com.github.ADBeveridge.Raider           # File Shredder
+    com.github.ADBeveridge.Raider           # File shredder
     org.localsend.localsend_app             # LocalSend (LAN file sharing)
     io.gitlab.adhami3310.Converter          # Switcheroo (image format converter)
-    io.podman_desktop.PodmanDesktop         # Podman Desktop (container management)
-    # NOTE: Resources (net.nokyan.Resources) is NOT installed via Flatpak —
-    # Ubuntu 26.04 ships Resources natively as the default system monitor.
+    io.podman_desktop.PodmanDesktop         # Podman Desktop
 
     # Multimedia
     org.shotcut.Shotcut                     # Video editor
@@ -426,12 +358,11 @@ install_flatpaks() {
     de.haeckerfelix.Shortwave               # Internet radio
     org.gnome.Podcasts                      # Podcasts
     nl.hjdskes.gcolor3                      # Color picker
-    com.vixalien.sticky                     # Sticky Notes
-    com.jeffser.Alpaca                      # Alpaca (local LLM)
+    com.vixalien.sticky                     # Sticky notes
+    com.jeffser.Alpaca                      # Local LLM
   )
 
   for app in "${FLATPAK_IDS[@]}"; do
-    # Strip inline comments
     app="${app%%#*}"
     app="${app//[[:space:]]/}"
     [[ -z "$app" ]] && continue
@@ -441,71 +372,48 @@ install_flatpaks() {
 }
 
 # ─────────────────────────────────────────────
-# CUDA TOOLKIT (driver-less)
-# This script intentionally does NOT install the NVIDIA driver itself —
-# Ubuntu already exposes that through:
-#   • The "Install third-party software" checkbox during a fresh install
-#   • Software & Updates → "Additional Drivers" tab (apt: software-properties-gtk)
-#   • CLI: sudo ubuntu-drivers install
-# This function only adds the FULL CUDA Toolkit (nvcc, cuBLAS, headers,
-# samples) on top of an already-installed driver, for build-time workloads.
+# CUDA TOOLKIT
+# Script does NOT install the NVIDIA driver —
+# use the "Install third-party software" checkbox
+# during Ubuntu setup, or: sudo ubuntu-drivers install
 # ─────────────────────────────────────────────
 install_cuda() {
   info "[CUDA] CUDA Toolkit installation"
 
-  # Precise filter using PCI class codes:
-  #   0300 = VGA, 0302 = 3D controller, 0380 = Display controller
   if ! lspci -d ::0300 -d ::0302 -d ::0380 2>/dev/null | grep -qi nvidia; then
-    warning "No NVIDIA GPU detected. Skipping CUDA installation."
+    warning "No NVIDIA GPU detected. Skipping."
     return
   fi
 
   GPU_INFO="$(lspci -d ::0300 -d ::0302 -d ::0380 2>/dev/null | grep -i nvidia | head -1)"
-  ok "NVIDIA GPU detected: $GPU_INFO"
+  ok "NVIDIA GPU: $GPU_INFO"
 
-  # Driver presence check — CUDA Toolkit needs the proprietary driver to be
-  # useful, and our pin (below) blocks NVIDIA's own driver packages, so we
-  # warn loudly if none is found.
   if ! dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -qE '^nvidia-driver-[0-9]+$'; then
-    warning "No NVIDIA driver detected on this system."
-    echo "  CUDA Toolkit needs the proprietary driver. Install it first via:"
-    echo "    1. Software & Updates → 'Additional Drivers' tab"
-    echo "       (run: sudo apt install software-properties-gtk if not present)"
-    echo "    2. CLI:  sudo ubuntu-drivers install"
-    echo "    3. The 'Install third-party software' checkbox during Ubuntu setup"
+    warning "No NVIDIA driver detected. Install it first via:"
+    echo "    1. Software & Updates → Additional Drivers"
+    echo "    2. CLI: sudo ubuntu-drivers install"
     echo
-    read -rp "  Continue with CUDA install anyway? [y/N]: " NO_DRIVER_CONFIRM
-    [[ "${NO_DRIVER_CONFIRM,,}" != "y" ]] && { warning "CUDA installation cancelled."; return; }
+    read -rp "  Continue anyway? [y/N]: " NO_DRIVER_CONFIRM
+    [[ "${NO_DRIVER_CONFIRM,,}" != "y" ]] && { warning "CUDA cancelled."; return; }
   else
-    ok "NVIDIA driver present — proceeding."
+    ok "NVIDIA driver present."
   fi
 
   echo
-  echo -e "${BOLD}── Full CUDA Toolkit (nvcc, cuBLAS, headers, samples) ──${NC}"
-  echo "Note: an installed NVIDIA driver already provides CUDA RUNTIME support for"
-  echo "apps (Blender, OBS, PyTorch wheels, etc.). This step adds the BUILD-time"
-  echo "toolkit on top — only useful if you're compiling CUDA code."
-  read -rp "  Add the official NVIDIA CUDA repo and install cuda-toolkit? [y/N]: " CUDA_CONFIRM
-  if [[ "${CUDA_CONFIRM,,}" != "y" ]]; then
-    ok "Skipped — driver-only CUDA support is sufficient for most applications."
-    return
-  fi
+  echo -e "${BOLD}── Full CUDA Toolkit (nvcc, cuBLAS, headers) ──${NC}"
+  echo "The installed driver already provides CUDA runtime for apps."
+  echo "This step adds the build-time toolkit (nvcc) — only needed for compiling CUDA code."
+  read -rp "  Install cuda-toolkit? [y/N]: " CUDA_CONFIRM
+  [[ "${CUDA_CONFIRM,,}" != "y" ]] && { ok "Skipped."; return; }
 
-  # Build the distro tag that NVIDIA's repo expects, e.g. "ubuntu2604"
   DISTRO_TAG="ubuntu${UBUNTU_VER//./}"
   ARCH="$(dpkg --print-architecture)"
   case "$ARCH" in
-    amd64)  CUDA_ARCH="x86_64" ;;
-    arm64)  CUDA_ARCH="sbsa"   ;;
-    *)      CUDA_ARCH=""       ;;
+    amd64) CUDA_ARCH="x86_64" ;;
+    arm64) CUDA_ARCH="sbsa"   ;;
+    *)     warning "Unsupported arch: $ARCH"; return ;;
   esac
 
-  if [[ -z "$CUDA_ARCH" ]]; then
-    warning "Unsupported architecture for CUDA: $ARCH — skipping."
-    return
-  fi
-
-  step "Adding NVIDIA CUDA repository for ${DISTRO_TAG} (${CUDA_ARCH})"
   KEYRING_DEB="/tmp/cuda-keyring.deb"
   if curl -fsSL --max-time 30 \
       "https://developer.download.nvidia.com/compute/cuda/repos/${DISTRO_TAG}/${CUDA_ARCH}/cuda-keyring_1.1-1_all.deb" \
@@ -514,21 +422,17 @@ install_cuda() {
     rm -f "$KEYRING_DEB"
     try sudo apt-get update
 
-    step "Pinning Ubuntu's NVIDIA driver packages so the CUDA repo doesn't override them"
-    # Without this pin, NVIDIA's repo can replace driver packages mid-upgrade
-    # and leave a broken module. The pin keeps Ubuntu in charge of the driver
-    # while NVIDIA only supplies cuda-toolkit and friends.
+    # Pin prevents NVIDIA repo from overriding Ubuntu's driver packages
     sudo tee /etc/apt/preferences.d/cuda-pin-nvidia-driver > /dev/null <<'EOF'
 Package: nvidia-driver-* nvidia-dkms-* nvidia-kernel-* libnvidia-* nvidia-utils-* nvidia-compute-utils-* xserver-xorg-video-nvidia-*
 Pin: origin developer.download.nvidia.com
 Pin-Priority: -1
 EOF
 
-    step "Installing cuda-toolkit (nvcc, libs, headers)"
     try "${APT_INSTALL[@]}" cuda-toolkit
     ok "CUDA Toolkit installed. Run 'nvcc --version' after rebooting."
   else
-    warning "Failed to download cuda-keyring.deb — check that ${DISTRO_TAG} is published by NVIDIA yet."
+    warning "Failed to download cuda-keyring.deb — ${DISTRO_TAG} may not be published yet."
   fi
 }
 
@@ -541,35 +445,31 @@ install_gnome_extensions() {
   export PATH="$HOME/.local/bin:$PATH"
 
   if ! command -v pipx &>/dev/null; then
-    step "Installing pipx"
     try "${APT_INSTALL[@]}" pipx
     try pipx ensurepath
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
   if ! command -v gext &>/dev/null; then
-    step "Installing gnome-extensions-cli via pipx"
     try pipx install gnome-extensions-cli
     export PATH="$HOME/.local/bin:$PATH"
   fi
 
-  # Ubuntu's own AppIndicator extension — disable to let the upstream version take over.
-  # (Ubuntu Dock is left enabled — Dash to Dock is no longer installed.)
+  # Disable Ubuntu's built-in AppIndicator to avoid conflict with upstream version
   if gnome-extensions list 2>/dev/null | grep -q '^ubuntu-appindicators@ubuntu.com$'; then
-    step "Disabling Ubuntu AppIndicators in favor of the upstream version"
+    step "Disabling ubuntu-appindicators in favor of upstream"
     try gnome-extensions disable ubuntu-appindicators@ubuntu.com
   fi
 
-  # NOTE: Dash to Dock is NOT installed — we keep Ubuntu Dock (the default,
-  # itself a fork of Dash to Dock) and just reconfigure it in apply_settings()
-  # to behave as a centered floating dock at the bottom.
+  # Ubuntu Dock is kept (not replaced by Dash to Dock)
+  # It is reconfigured in apply_settings() to float centered at the bottom
   EXTENSIONS=(
-    appindicatorsupport@rgcjonas.gmail.com    # AppIndicator (system tray support)
-    caffeine@patapon.info                     # Caffeine (prevent suspend)
-    clipboard-indicator@tudmotu.com           # Clipboard Indicator (clipboard manager)
-    gsconnect@andyholmes.github.io            # GSConnect (KDE Connect for GNOME)
+    appindicatorsupport@rgcjonas.gmail.com    # AppIndicator
+    caffeine@patapon.info                     # Caffeine
+    clipboard-indicator@tudmotu.com           # Clipboard Indicator
+    gsconnect@andyholmes.github.io            # GSConnect
     tilingshell@ferrarodomenico.com           # Tiling Shell
-    Vitals@CoreCoding.com                     # Vitals (CPU/RAM/temp/network monitor in panel)
+    Vitals@CoreCoding.com                     # Vitals
     AlphabeticalAppGrid@stuarthayhurst        # Alphabetical App Grid
   )
 
@@ -582,119 +482,70 @@ install_gnome_extensions() {
       try gext install "$ext"
       try gext enable "$ext"
     done
-    ok "Extensions installed. Some may show errors until the next GNOME Shell update."
+    ok "Extensions installed."
   else
-    warning "gext not available. Install manually via Extension Manager."
-    echo "  Required extensions:"
+    warning "gext not available — install manually via Extension Manager."
     printf '    - %s\n' "${EXTENSIONS[@]}"
   fi
 }
 
 # ─────────────────────────────────────────────
 # BLOATWARE REMOVAL
-# Run AFTER installing everything to avoid
-# breaking dependencies during installation
+# Run AFTER installing everything
 # ─────────────────────────────────────────────
 remove_bloat() {
   info "[CLEANUP] Removing bloatware"
   warning "Run this step AFTER installing everything to avoid dependency issues."
 
-  # Backup the package list before removing anything (recovery aid)
   BACKUP_FILE="$HOME/ubuntu-y2k-packages-before-cleanup-$(date +%Y%m%d-%H%M%S).txt"
-  step "Backing up current package list to $BACKUP_FILE"
-  if dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > "$BACKUP_FILE"; then
-    ok "Backup saved (restore with: sudo apt-get install \$(cat $BACKUP_FILE))."
-  else
-    warning "Failed to write backup."
-  fi
+  dpkg-query -W -f='${Package}\n' 2>/dev/null | sort > "$BACKUP_FILE" \
+    && ok "Package backup: $BACKUP_FILE"
 
-  step "Removing LibreOffice (replaced by FreeOffice)"
+  step "LibreOffice (replaced by FreeOffice)"
   purge_if_installed 'libreoffice*'
 
-  step "Removing default GNOME media players (replaced by VLC)"
-  # Ubuntu 26.04 ships Showtime + Decibels as new defaults. Keep cleanup compatible
-  # with upgrades from 24.04/25.10 by also removing legacy Totem/Rhythmbox.
-  # purge_if_installed silently skips packages that aren't there (e.g. Decibels
-  # may not be in the archives yet, Cheese was removed from default installs).
-  purge_if_installed \
-    showtime \
-    decibels \
-    totem \
-    totem-plugins \
-    rhythmbox \
-    rhythmbox-plugins \
-    gnome-music
+  step "Default media players (replaced by VLC)"
+  purge_if_installed showtime decibels totem totem-plugins \
+    rhythmbox rhythmbox-plugins gnome-music
 
-  step "Removing default photo/scanner apps replaced by Loupe / Simple Scan"
+  step "Shotwell (replaced by Loupe)"
   purge_if_installed shotwell
 
-  step "Removing default mail client (using Chrome/web mail)"
+  step "Thunderbird"
   purge_if_installed 'thunderbird*'
 
-  step "Removing default torrent client (replaced by Motrix Flatpak)"
+  step "Transmission (replaced by Motrix)"
   purge_if_installed 'transmission-*'
 
-  step "Removing GNOME Extensions Manager apt app (replaced by Extension Manager Flatpak)"
+  step "GNOME Extensions apt app (replaced by Extension Manager Flatpak)"
   purge_if_installed gnome-shell-extension-prefs
 
-  step "Removing Snap Store / App Center (keeping GNOME Software as default store)"
-  # On Ubuntu 26.04 the App Center is delivered as a snap named 'snap-store'.
-  # We keep gnome-software (installed in [GNOME apps]) as the unified store —
-  # it now handles Flatpaks too via gnome-software-plugin-flatpak. snapd itself
-  # stays installed in case any other snap is still in use.
-  # SAFETY: only remove snap-store if gnome-software is already present —
-  # otherwise we'd leave the system with no app store at all (matters if the
-  # user runs option [3] standalone without having run [4] first).
+  step "Snap Store / App Center (replaced by GNOME Software)"
   if ! dpkg -s gnome-software &>/dev/null; then
-    warning "gnome-software not installed — skipping snap-store removal to avoid"
-    warning "leaving the system without any app store. Run option [4] first."
+    warning "gnome-software not installed — skipping snap-store removal. Run [4] first."
   elif command -v snap &>/dev/null && snap list snap-store &>/dev/null 2>&1; then
     try sudo snap remove --purge snap-store
   fi
-  # Defensive: remove any apt-side shim if it exists under either name.
   purge_if_installed ubuntu-software
 
-  step "Removing Firefox snap (replaced by the native .deb from Mozilla PPA)"
-  # SAFETY: only remove the snap if the REAL .deb is installed — not just the
-  # snap shim. The shim (package: firefox, version: 1:1snap1-*) is also an apt
-  # package, so dpkg -s firefox returns 0 for both. We check the version string:
-  # the shim always contains 'snap', the real .deb never does.
-  # Without this check, a failed .deb install would cause us to remove the snap
-  # and leave the user with no browser at all.
+  step "Firefox snap (replaced by Mozilla PPA .deb)"
+  # Check version string — snap shim always contains 'snap', real .deb never does
   FIREFOX_VER=$(dpkg-query -W -f='${Version}' firefox 2>/dev/null || true)
   if [[ -z "$FIREFOX_VER" ]] || [[ "$FIREFOX_VER" == *snap* ]]; then
-    warning "Firefox .deb not installed (snap shim still active) — skipping snap"
-    warning "removal to avoid losing the browser. Run option [4] first."
+    warning "Firefox .deb not installed (snap shim still active) — skipping snap removal."
+    warning "Run option [4] first to install the .deb from Mozilla PPA."
   elif command -v snap &>/dev/null && snap list firefox &>/dev/null 2>&1; then
     try sudo snap remove --purge firefox
   fi
 
-  # NOTE: gnome-system-monitor is no longer installed by default on Ubuntu 26.04
-  # (replaced upstream by Resources, which is now the apt default). Nothing to remove.
+  step "GNOME games"
+  purge_if_installed aisleriot gnome-mahjongg gnome-mines gnome-sudoku gnome-2048
 
-  step "Removing GNOME games"
-  purge_if_installed \
-    aisleriot \
-    gnome-mahjongg \
-    gnome-mines \
-    gnome-sudoku \
-    gnome-2048
+  step "Unnecessary apps"
+  purge_if_installed cheese gnome-tour gnome-weather gnome-maps gnome-notes \
+    foliate paperboy yelp yelp-xsl dconf-editor htop
 
-  step "Removing unnecessary apps"
-  purge_if_installed \
-    cheese \
-    gnome-tour \
-    gnome-weather \
-    gnome-maps \
-    gnome-notes \
-    foliate \
-    paperboy \
-    yelp \
-    yelp-xsl \
-    dconf-editor \
-    htop
-
-  step "Cleaning orphan dependencies"
+  step "Orphan cleanup"
   try sudo apt-get autoremove --purge -y
   try sudo apt-get autoclean -y
 
@@ -707,101 +558,53 @@ remove_bloat() {
 apply_settings() {
   info "[SETTINGS] Applying GNOME settings and default apps"
 
-  # ── Appearance ──
   try gsettings set org.gnome.desktop.interface icon-theme         'Papirus'
   try gsettings set org.gnome.desktop.interface color-scheme       'prefer-dark'
   try gsettings set org.gnome.desktop.interface clock-show-date    true
   try gsettings set org.gnome.desktop.interface clock-show-seconds true
-
-  # ── Title bar buttons: add Minimize and Maximize (right side) ──
   try gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,maximize,close'
 
-  # ── Desktop icons (DING — Desktop Icons NG) ──
-  # Hide the Home folder shortcut on the desktop. Trash and other defaults stay.
-  step "Hiding Home icon from the desktop"
+  step "Hiding Home icon from desktop"
   try gsettings set org.gnome.shell.extensions.ding show-home false
 
-  # ── Ubuntu Dock layout — centered floating dock at the bottom ──
-  # Ubuntu Dock is a fork of Dash to Dock and shares its schema, so the same
-  # keys configure both. We don't replace the dock — we just reshape it:
-  #   - dock-position=BOTTOM  → move from the default left side to the bottom
-  #   - extend-height=false   → don't span the full screen edge; sit centered
-  #     on the visible apps only (the Dash to Dock floating look)
-  step "Configuring Ubuntu Dock (bottom, centered, not extended)"
+  step "Ubuntu Dock — bottom, centered, floating"
   try gsettings set org.gnome.shell.extensions.dash-to-dock dock-position 'BOTTOM'
   try gsettings set org.gnome.shell.extensions.dash-to-dock extend-height false
 
-  # ── Dock favorites (Chrome, Files, Text Editor, Terminal, Calculator) ──
-  # Note: Ubuntu 26.04 ships Ptyxis as the default terminal (same as Fedora 41+).
-  step "Setting dock shortcuts"
+  step "Dock shortcuts"
   try gsettings set org.gnome.shell favorite-apps \
     "['google-chrome.desktop', 'org.gnome.Nautilus.desktop', 'org.gnome.TextEditor.desktop', 'org.gnome.Ptyxis.desktop', 'org.gnome.Calculator.desktop']"
 
-  # ── Default browser: Google Chrome ──
-  step "Setting Google Chrome as default web browser"
+  step "Google Chrome as default browser"
   try xdg-settings set default-web-browser google-chrome.desktop
 
-  # ── Default media player: VLC ──
-  # Uses three methods combined for reliability on modern GNOME:
-  #   1. xdg-mime  — writes to ~/.config/mimeapps.list
-  #   2. gio mime  — GNOME's own tool, overrides gnome-mimeapps.list entries
-  #   3. Direct write to mimeapps.list — guarantees persistence across sessions
-  step "Setting VLC as default audio and video player"
-
+  step "VLC as default audio and video player"
   if [[ ! -f /usr/share/applications/vlc.desktop ]]; then
-    warning "VLC is not installed yet — skipping default media player setup."
-    warning "Re-run option [8] after installing VLC (apt: vlc)."
+    warning "VLC not installed — skipping. Re-run [8] after [4]."
   else
     MEDIA_TYPES=(
-    video/mp4
-    video/x-matroska
-    video/webm
-    video/avi
-    video/quicktime
-    video/x-msvideo
-    video/mpeg
-    video/x-flv
-    video/3gpp
-    video/ogg
-    audio/mpeg
-    audio/ogg
-    audio/flac
-    audio/x-wav
-    audio/aac
-    audio/mp4
-    audio/x-m4a
-    audio/opus
-    audio/webm
-  )
+      video/mp4 video/x-matroska video/webm video/avi video/quicktime
+      video/x-msvideo video/mpeg video/x-flv video/3gpp video/ogg
+      audio/mpeg audio/ogg audio/flac audio/x-wav audio/aac
+      audio/mp4 audio/x-m4a audio/opus audio/webm
+    )
+    for mime in "${MEDIA_TYPES[@]}"; do
+      try xdg-mime default vlc.desktop "$mime"
+      gio mime "$mime" vlc.desktop 2>/dev/null || true
+    done
 
-  for mime in "${MEDIA_TYPES[@]}"; do
-    try xdg-mime default vlc.desktop "$mime"
-    gio mime "$mime" vlc.desktop 2>/dev/null || true
-  done
-
-  # Direct write to mimeapps.list as final guarantee
-  MIMEAPPS="$HOME/.config/mimeapps.list"
-  mkdir -p "$HOME/.config"
-
-  # Ensure [Default Applications] section exists
-  if ! grep -q '^\[Default Applications\]' "$MIMEAPPS" 2>/dev/null; then
-    echo '[Default Applications]' >> "$MIMEAPPS"
+    MIMEAPPS="$HOME/.config/mimeapps.list"
+    mkdir -p "$HOME/.config"
+    grep -q '^\[Default Applications\]' "$MIMEAPPS" 2>/dev/null \
+      || echo '[Default Applications]' >> "$MIMEAPPS"
+    for mime in "${MEDIA_TYPES[@]}"; do
+      sed -i "/^${mime//\//\\/}=/d" "$MIMEAPPS" 2>/dev/null || true
+      sed -i "/^\[Default Applications\]/a ${mime}=vlc.desktop" "$MIMEAPPS"
+    done
+    ok "VLC set as default."
   fi
 
-  # For each MIME type: remove any existing entry then add VLC
-  for mime in "${MEDIA_TYPES[@]}"; do
-    sed -i "/^${mime//\//\\/}=/d" "$MIMEAPPS" 2>/dev/null || true
-    sed -i "/^\[Default Applications\]/a ${mime}=vlc.desktop" "$MIMEAPPS"
-  done
-
-  ok "VLC set as default for audio and video (xdg-mime + gio mime + mimeapps.list)."
-  fi
-
-  # ── Chrome: Wayland + touchpad two-finger back/forward gestures ──
-  # Ubuntu 26.04 is Wayland-only by default, but the flag is still useful to
-  # force native Wayland in Chrome (otherwise it may run under XWayland).
-  step "Configuring Chrome for Wayland touchpad gestures"
-
+  step "Chrome — Wayland + touchpad gestures"
   FLAGS_FILE="$HOME/.config/chrome-flags.conf"
   mkdir -p "$HOME/.config"
   grep -qxF -- '--ozone-platform=wayland' "$FLAGS_FILE" 2>/dev/null \
@@ -815,23 +618,22 @@ apply_settings() {
   if [[ -f "$DESKTOP_SRC" ]]; then
     cp "$DESKTOP_SRC" "$DESKTOP_DEST"
     sed -i '/^Exec=\/usr\/bin\/google-chrome-stable/ s|%U|--ozone-platform=wayland --enable-features=TouchpadOverscrollHistoryNavigation %U|g' "$DESKTOP_DEST"
-    ok "Chrome configured for Wayland and touchpad gestures."
+    ok "Chrome configured for Wayland."
   else
-    warning "google-chrome.desktop not found — Chrome may not be installed yet. Re-run option [8] after installing Chrome."
+    warning "google-chrome.desktop not found — re-run [8] after [4]."
   fi
 
-  # ── Wallpaper ──
-  step "Downloading and applying wallpaper"
-  WALLPAPER_URL="https://www.nasa.gov/wp-content/uploads/2026/04/art002e009288orig.jpg"
+  step "Wallpaper"
   WALLPAPER_PATH="$HOME/Pictures/nasa-wallpaper.jpg"
   mkdir -p "$HOME/Pictures"
-  if curl -fsSL "$WALLPAPER_URL" -o "$WALLPAPER_PATH"; then
+  if curl -fsSL "https://www.nasa.gov/wp-content/uploads/2026/04/art002e009288orig.jpg" \
+      -o "$WALLPAPER_PATH"; then
     try gsettings set org.gnome.desktop.background picture-uri      "file://$WALLPAPER_PATH"
     try gsettings set org.gnome.desktop.background picture-uri-dark "file://$WALLPAPER_PATH"
     try gsettings set org.gnome.desktop.background picture-options  'zoom'
     ok "Wallpaper applied."
   else
-    warning "Failed to download wallpaper. Check your connection."
+    warning "Failed to download wallpaper."
   fi
 
   ok "Settings applied."
@@ -846,100 +648,94 @@ verify_final() {
   echo
   echo -e "${BOLD}── Packages that should have been REMOVED ──${NC}"
   REMOVED_CHECK=$(dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E \
-    "^libreoffice|^showtime$|^decibels$|^totem$|^totem-plugins$|^rhythmbox$|^gnome-music$|^shotwell$|^thunderbird|^transmission-|^gnome-shell-extension-prefs$|^aisleriot$|^gnome-mahjongg$|^gnome-mines$|^gnome-sudoku$|^cheese$|^gnome-tour$|^gnome-weather$|^gnome-maps$|^gnome-notes$|^foliate$|^paperboy$|^yelp$|^dconf-editor$|^htop$" \
-    || true)
+    "^libreoffice|^showtime$|^decibels$|^totem$|^rhythmbox$|^gnome-music$|^shotwell$|\
+^thunderbird|^transmission-|^gnome-shell-extension-prefs$|^aisleriot$|^gnome-mahjongg$|\
+^gnome-mines$|^gnome-sudoku$|^cheese$|^gnome-tour$|^gnome-weather$|^gnome-maps$|\
+^gnome-notes$|^foliate$|^paperboy$|^yelp$|^dconf-editor$|^htop$" || true)
   if [[ -z "$REMOVED_CHECK" ]]; then
     ok "No unwanted packages found."
   else
-    warning "Still present:"
-    echo "$REMOVED_CHECK"
+    warning "Still present:"; echo "$REMOVED_CHECK"
   fi
 
   echo
-  echo -e "${BOLD}── APT packages that should exist ──${NC}"
+  echo -e "${BOLD}── APT packages ──${NC}"
   dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -E \
-    "^google-chrome-stable$|^brave-browser$|^firefox$|^vlc$|^audacity$|^darktable$|^handbrake$|^inkscape$|^easyeffects$|^gimp$|^blender$|^steam|^dreamchess$|^nordvpn$|^obs-studio$|^gnome-software$|^papirus-icon-theme$|^softmaker-freeoffice|^solaar$|^timeshift$|^deja-dup$" \
-    || warning "Some APT packages may not be installed."
+    "^google-chrome-stable$|^brave-browser$|^firefox$|^vlc$|^audacity$|^darktable$|\
+^handbrake$|^inkscape$|^easyeffects$|^gimp$|^blender$|^steam|^dreamchess$|^nordvpn$|\
+^obs-studio$|^gnome-software$|^papirus-icon-theme$|^softmaker-freeoffice|^solaar$|\
+^timeshift$|^deja-dup$" || warning "Some APT packages may not be installed."
 
   echo
-  echo -e "${BOLD}── Essential codecs ──${NC}"
-  if dpkg -s ubuntu-restricted-extras &>/dev/null; then
-    ok "ubuntu-restricted-extras installed."
-  else
-    warning "ubuntu-restricted-extras NOT installed — proprietary codecs may be missing."
-  fi
-  if dpkg -s libavcodec-extra &>/dev/null; then
-    ok "libavcodec-extra installed."
-  else
-    warning "libavcodec-extra NOT installed."
-  fi
+  echo -e "${BOLD}── Codecs ──${NC}"
+  dpkg -s ubuntu-restricted-extras &>/dev/null \
+    && ok "ubuntu-restricted-extras installed." \
+    || warning "ubuntu-restricted-extras NOT installed."
+  dpkg -s libavcodec-extra &>/dev/null \
+    && ok "libavcodec-extra installed." \
+    || warning "libavcodec-extra NOT installed."
 
   echo
-  echo -e "${BOLD}── Default applications ──${NC}"
+  echo -e "${BOLD}── Default apps ──${NC}"
   BROWSER=$(xdg-settings get default-web-browser 2>/dev/null || echo "not set")
-  echo "  Default browser : $BROWSER"
-  VIDEO_DEFAULT=$(xdg-mime query default video/mp4 2>/dev/null || echo "not set")
-  echo "  Default video   : $VIDEO_DEFAULT"
-  AUDIO_DEFAULT=$(xdg-mime query default audio/mpeg 2>/dev/null || echo "not set")
-  echo "  Default audio   : $AUDIO_DEFAULT"
+  VIDEO=$(xdg-mime query default video/mp4 2>/dev/null || echo "not set")
+  AUDIO=$(xdg-mime query default audio/mpeg 2>/dev/null || echo "not set")
   BUTTONS=$(gsettings get org.gnome.desktop.wm.preferences button-layout 2>/dev/null || echo "not set")
-  echo "  Title bar btns  : $BUTTONS"
-  if [[ "$BROWSER" == *"google-chrome"* ]]; then ok "Chrome is default browser."; else warning "Chrome is NOT the default browser."; fi
-  if [[ "$VIDEO_DEFAULT" == *"vlc"* ]];     then ok "VLC is default video player."; else warning "VLC is NOT the default video player."; fi
-  if [[ "$AUDIO_DEFAULT" == *"vlc"* ]];     then ok "VLC is default audio player."; else warning "VLC is NOT the default audio player."; fi
-  if [[ "$BUTTONS" == *"minimize,maximize"* ]]; then ok "Minimize/Maximize buttons active."; else warning "Minimize/Maximize buttons not set."; fi
+  echo "  Browser : $BROWSER"
+  echo "  Video   : $VIDEO"
+  echo "  Audio   : $AUDIO"
+  echo "  Buttons : $BUTTONS"
+  [[ "$BROWSER" == *"google-chrome"* ]] && ok "Chrome is default." || warning "Chrome NOT default."
+  [[ "$VIDEO" == *"vlc"* ]]            && ok "VLC is default video." || warning "VLC NOT default video."
+  [[ "$AUDIO" == *"vlc"* ]]            && ok "VLC is default audio." || warning "VLC NOT default audio."
+  [[ "$BUTTONS" == *"minimize,maximize"* ]] && ok "Min/Max buttons active." || warning "Min/Max buttons not set."
 
   echo
-  echo -e "${BOLD}── Installed Flatpaks ──${NC}"
+  echo -e "${BOLD}── Flatpaks ──${NC}"
   flatpak list --app --columns=application 2>/dev/null | grep -E \
-    "Alpaca|Flatseal|Blanket|Raider|FreeCAD|Upscayl|Shotcut|VideoTrimmer|cameractrls|converseen|nokse22.Exhibit|Minder|Motrix|localsend|PeaZip|Podcasts|Popsicle|Shortwave|sticky|Converter|ExtensionManager|PodmanDesktop" \
-    || warning "Some expected Flatpaks may not be installed."
+    "Alpaca|Flatseal|Blanket|Raider|FreeCAD|Upscayl|Shotcut|VideoTrimmer|\
+cameractrls|converseen|Exhibit|Minder|Motrix|localsend|PeaZip|Podcasts|\
+Popsicle|Shortwave|sticky|Converter|ExtensionManager|PodmanDesktop" \
+    || warning "Some Flatpaks may not be installed."
 
   echo
-  echo -e "${BOLD}── NVIDIA GPU ──${NC}"
+  echo -e "${BOLD}── NVIDIA ──${NC}"
   if lspci -d ::0300 -d ::0302 -d ::0380 2>/dev/null | grep -qi nvidia; then
-    if dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -qE '^nvidia-driver-[0-9]+$|^nvidia-dkms-[0-9]+$'; then
+    if dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -qE '^nvidia-driver-[0-9]+$'; then
       ok "NVIDIA driver installed."
-      nvidia-smi 2>/dev/null | head -4 || warning "nvidia-smi not available (reboot to load the module)."
-      if command -v nvcc &>/dev/null; then
-        ok "Full CUDA Toolkit present: $(nvcc --version | grep release)"
-      else
-        echo "  ℹ CUDA Toolkit (nvcc) not installed — driver-only CUDA support active."
-      fi
+      nvidia-smi 2>/dev/null | head -4 || warning "nvidia-smi unavailable — reboot needed."
+      command -v nvcc &>/dev/null \
+        && ok "CUDA Toolkit: $(nvcc --version | grep release)" \
+        || echo "  ℹ Driver-only CUDA (no nvcc)."
     else
-      warning "NVIDIA GPU detected but driver NOT installed."
-      echo "  Install via: Software & Updates → Additional Drivers, or:"
-      echo "    sudo ubuntu-drivers install"
+      warning "NVIDIA GPU found but driver NOT installed."
+      echo "  → sudo ubuntu-drivers install"
     fi
   else
-    ok "No NVIDIA GPU (no driver needed)."
+    ok "No NVIDIA GPU."
   fi
 
   echo
   echo -e "${BOLD}── GNOME Extensions ──${NC}"
-  if command -v gnome-extensions &>/dev/null; then
-    gnome-extensions list --enabled 2>/dev/null || true
-  else
-    warning "gnome-extensions not available."
-  fi
+  command -v gnome-extensions &>/dev/null \
+    && gnome-extensions list --enabled 2>/dev/null \
+    || warning "gnome-extensions not available."
 }
 
 # ─────────────────────────────────────────────
 # RUN EVERYTHING
-# Correct order: install everything → remove bloat
 # ─────────────────────────────────────────────
 run_all() {
   echo
   echo -e "${YELLOW}This will run all steps in the correct order.${NC}"
-  echo -e "${CYAN}Order: repos → update → APT pkgs → FreeOffice → Flatpaks → CUDA → Extensions → Remove bloat → Settings${NC}"
+  echo -e "${CYAN}repos → update → APT → FreeOffice → Flatpaks → CUDA → Extensions → Bloat removal → Settings${NC}"
   echo
 
-  # Disk space check — full install needs roughly 15+ GB free
   AVAIL_GB=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
   if [[ -n "$AVAIL_GB" ]]; then
     echo -e "${BOLD}Free space on /: ${AVAIL_GB} GB${NC}"
     if [[ "$AVAIL_GB" -lt 15 ]]; then
-      warning "Less than 15 GB free — full install may run out of space (Steam + Blender + CUDA can easily exceed this)."
+      warning "Less than 15 GB free — Steam + Blender + CUDA can exceed this."
       read -rp "Continue anyway? [y/N]: " DISK_CONFIRM
       [[ "${DISK_CONFIRM,,}" != "y" ]] && { warning "Cancelled."; return; }
     fi
@@ -948,18 +744,17 @@ run_all() {
   read -rp "Confirm? [y/N]: " CONFIRM
   [[ "${CONFIRM,,}" != "y" ]] && { warning "Cancelled."; return; }
 
-  # Reset warning counter for clean final summary
   WARN_COUNT=0
 
   add_repos
   update_system
-  install_apt_packages  # Installs everything (including codecs)
-  install_freeoffice    # FreeOffice before removing LibreOffice
+  install_apt_packages
+  install_freeoffice
   install_flatpaks
-  install_cuda          # CUDA Toolkit only — driver is user's responsibility
+  install_cuda
   install_gnome_extensions
-  remove_bloat          # Removes LibreOffice and bloat AFTER installing everything
-  apply_settings        # Visual settings + default apps
+  remove_bloat
+  apply_settings
   verify_final
 
   echo
@@ -971,8 +766,8 @@ run_all() {
   else
     warning "Setup complete with $WARN_COUNT warning(s) — review the log above."
   fi
-  echo "  Full log saved to: $LOG_FILE"
-  echo -e "${YELLOW}⚠ Reboot the system to activate all drivers and settings.${NC}"
+  echo "  Log: $LOG_FILE"
+  echo -e "${YELLOW}⚠ Reboot to activate all drivers and settings.${NC}"
 }
 
 # ─────────────────────────────────────────────
@@ -980,7 +775,6 @@ run_all() {
 # ─────────────────────────────────────────────
 while true; do
   show_menu
-
   case "$CHOICE" in
     1) run_all ;;
     2) add_repos; update_system ;;
@@ -995,7 +789,6 @@ while true; do
     r|R) echo "Rebooting..."; sudo reboot ;;
     *) warning "Invalid option." ;;
   esac
-
   echo
   read -rp "Press ENTER to return to the menu..." _
 done
