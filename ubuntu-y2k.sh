@@ -252,7 +252,7 @@ install_apt_packages() {
 
   step "Utilities"
   try "${APT_INSTALL[@]}" \
-    timeshift solaar dreamchess lm-sensors
+    timeshift solaar dreamchess lm-sensors input-leap
 
   # ── NordVPN — official installer (handles repo + GPG + install) ──
   step "NordVPN"
@@ -330,7 +330,6 @@ install_flatpaks() {
     org.localsend.localsend_app             # LocalSend (LAN file sharing)
     io.gitlab.adhami3310.Converter          # Switcheroo (image format converter)
     io.podman_desktop.PodmanDesktop         # Podman Desktop (container management)
-    io.github.input_leap.InputLeap          # InputLeap (share mouse/keyboard across computers)
     # NOTE: Resources (net.nokyan.Resources) is NOT installed via Flatpak —
     # Ubuntu 26.04 ships Resources natively as the default system monitor.
 
