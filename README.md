@@ -60,7 +60,7 @@ bash ubuntu-y2k.sh
 | 🎨 Graphics / 3D | GIMP, Inkscape, Blender |
 | 🎮 Gaming | Steam |
 | 🖥️ GNOME Apps | Tweaks, Boxes, Backups, Calculator, Calendar, Snapshot, Connections, Contacts, Simple Scan, Disk Utility, Text Editor, Font Viewer, Software, Clocks, Logs, Evince, Loupe |
-| 🔧 Utilities | Timeshift, Solaar, Dreamchess, lm-sensors |
+| 🔧 Utilities | Timeshift, Solaar, Dreamchess, lm-sensors, InputLeap |
 | 🔒 VPN | NordVPN (official installer) |
 | 📄 Office | FreeOffice 2024 (replaces LibreOffice) |
 
@@ -97,6 +97,7 @@ Installed via `gnome-extensions-cli`:
 | GSConnect | KDE Connect integration for GNOME |
 | Tiling Shell | Window tiling manager |
 | Vitals | CPU / RAM / temp / network monitor in the top bar |
+| Alphabetical App Grid | Sort the app grid alphabetically |
 
 ---
 
