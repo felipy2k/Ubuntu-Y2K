@@ -172,15 +172,11 @@ install_codecs() {
   # unrar, and the right GStreamer plugin set for the desktop.
   try "${APT_INSTALL[@]}" ubuntu-restricted-extras
 
-  step "Installing extended GStreamer plugin set"
+  step "Installing only what ubuntu-restricted-extras does NOT already include"
+  # gstreamer1.0-vaapi — VA-API bridge for GStreamer (hardware decode/encode)
+  # ffmpeg             — full CLI binary (restricted-extras only pulls the libs)
   try "${APT_INSTALL[@]}" \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
     gstreamer1.0-vaapi \
-    libavcodec-extra \
     ffmpeg
 
   step "Hardware video acceleration (VA-API/VDPAU)"
